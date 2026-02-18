@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 )
 
 // Client is the main API client for T.LY.
@@ -13,6 +16,16 @@ type Client struct {
 	APIKey  string
 	BaseURL string
 	Client  *http.Client
+}
+
+// APIError is returned when the T.LY API responds with a non-2xx status.
+type APIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("API error (status %d): %s", e.StatusCode, e.Body)
 }
 
 // NewClient creates a new T.LY API client.
@@ -24,42 +37,80 @@ func NewClient(apiKey string) *Client {
 	}
 }
 
-// doRequest is an internal helper for making API calls.
-func (c *Client) doRequest(method, path, query string, body interface{}, result interface{}) error {
-	url := c.BaseURL + path
-	if query != "" {
-		url += "?" + query
+func (c *Client) doRequestRaw(method, path string, query url.Values, body interface{}) ([]byte, error) {
+	requestURL := strings.TrimRight(c.BaseURL, "/") + path
+	if query != nil && len(query) > 0 {
+		requestURL += "?" + query.Encode()
 	}
-	var buf *bytes.Buffer
+
+	var reqBody *bytes.Buffer
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		buf = bytes.NewBuffer(data)
+		reqBody = bytes.NewBuffer(data)
 	} else {
-		buf = bytes.NewBuffer(nil)
+		reqBody = bytes.NewBuffer(nil)
 	}
-	req, err := http.NewRequest(method, url, buf)
+
+	req, err := http.NewRequest(method, requestURL, reqBody)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+
 	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, readErr := ioutil.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, readErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Body:       string(data),
+		}
+	}
+	return data, nil
+}
+
+// doRequest is an internal helper for making API calls and decoding JSON responses.
+func (c *Client) doRequest(method, path string, query url.Values, body interface{}, result interface{}) error {
+	data, err := c.doRequestRaw(method, path, query, body)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("API error: %s", string(data))
+
+	if result == nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
 	}
-	if result != nil {
-		return json.NewDecoder(resp.Body).Decode(result)
+	if byteTarget, ok := result.(*[]byte); ok {
+		*byteTarget = append((*byteTarget)[:0], data...)
+		return nil
 	}
-	return nil
+
+	return json.Unmarshal(data, result)
+}
+
+func queryFromMap(params map[string]string) url.Values {
+	query := url.Values{}
+	for k, v := range params {
+		query.Set(k, v)
+	}
+	return query
+}
+
+func addIndexedIntSlice(query url.Values, key string, values []int) {
+	for i, v := range values {
+		query.Set(fmt.Sprintf("%s[%d]", key, i), strconv.Itoa(v))
+	}
 }
 
 // =====================
@@ -94,7 +145,7 @@ type PixelUpdateRequest struct {
 // CreatePixel calls the API to create a new pixel.
 func (c *Client) CreatePixel(reqData PixelCreateRequest) (*Pixel, error) {
 	var pixel Pixel
-	err := c.doRequest("POST", "/api/v1/link/pixel", "", reqData, &pixel)
+	err := c.doRequest(http.MethodPost, "/api/v1/link/pixel", nil, reqData, &pixel)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +155,7 @@ func (c *Client) CreatePixel(reqData PixelCreateRequest) (*Pixel, error) {
 // ListPixels retrieves a list of pixels.
 func (c *Client) ListPixels() ([]Pixel, error) {
 	var pixels []Pixel
-	err := c.doRequest("GET", "/api/v1/link/pixel", "", nil, &pixels)
+	err := c.doRequest(http.MethodGet, "/api/v1/link/pixel", nil, nil, &pixels)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +166,7 @@ func (c *Client) ListPixels() ([]Pixel, error) {
 func (c *Client) GetPixel(id int) (*Pixel, error) {
 	path := fmt.Sprintf("/api/v1/link/pixel/%d", id)
 	var pixel Pixel
-	err := c.doRequest("GET", path, "", nil, &pixel)
+	err := c.doRequest(http.MethodGet, path, nil, nil, &pixel)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +177,7 @@ func (c *Client) GetPixel(id int) (*Pixel, error) {
 func (c *Client) UpdatePixel(reqData PixelUpdateRequest) (*Pixel, error) {
 	path := fmt.Sprintf("/api/v1/link/pixel/%d", reqData.ID)
 	var pixel Pixel
-	err := c.doRequest("PUT", path, "", reqData, &pixel)
+	err := c.doRequest(http.MethodPut, path, nil, reqData, &pixel)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +187,7 @@ func (c *Client) UpdatePixel(reqData PixelUpdateRequest) (*Pixel, error) {
 // DeletePixel deletes a pixel by its ID.
 func (c *Client) DeletePixel(id int) error {
 	path := fmt.Sprintf("/api/v1/link/pixel/%d", id)
-	return c.doRequest("DELETE", path, "", nil, nil)
+	return c.doRequest(http.MethodDelete, path, nil, nil, nil)
 }
 
 // =====================
@@ -145,17 +196,21 @@ func (c *Client) DeletePixel(id int) error {
 
 // ShortLink represents a shortened URL.
 type ShortLink struct {
-	ShortURL         string      `json:"short_url"`
-	Description      string      `json:"description"`
-	LongURL          string      `json:"long_url"`
-	Domain           string      `json:"domain"`
-	ShortID          string      `json:"short_id"`
-	ExpireAtViews    interface{} `json:"expire_at_views"`
-	ExpireAtDatetime interface{} `json:"expire_at_datetime"`
-	PublicStats      bool        `json:"public_stats"`
-	CreatedAt        string      `json:"created_at"`
-	UpdatedAt        string      `json:"updated_at"`
-	Meta             interface{} `json:"meta"`
+	ShortURL         string        `json:"short_url"`
+	Description      *string       `json:"description"`
+	LongURL          string        `json:"long_url"`
+	Domain           string        `json:"domain"`
+	ShortID          string        `json:"short_id"`
+	ExpireAtViews    interface{}   `json:"expire_at_views"`
+	ExpireAtDatetime interface{}   `json:"expire_at_datetime"`
+	PublicStats      bool          `json:"public_stats"`
+	CreatedAt        string        `json:"created_at"`
+	UpdatedAt        string        `json:"updated_at"`
+	Meta             interface{}   `json:"meta"`
+	QRCodeURL        string        `json:"qr_code_url,omitempty"`
+	QRCodeBase64     string        `json:"qr_code_base64,omitempty"`
+	Tags             []interface{} `json:"tags,omitempty"`
+	Pixels           []interface{} `json:"pixels,omitempty"`
 }
 
 // ShortLinkCreateRequest is used to create a short link.
@@ -191,7 +246,7 @@ type ShortLinkUpdateRequest struct {
 // CreateShortLink creates a new short link.
 func (c *Client) CreateShortLink(reqData ShortLinkCreateRequest) (*ShortLink, error) {
 	var link ShortLink
-	err := c.doRequest("POST", "/api/v1/link/shorten", "", reqData, &link)
+	err := c.doRequest(http.MethodPost, "/api/v1/link/shorten", nil, reqData, &link)
 	if err != nil {
 		return nil, err
 	}
@@ -200,9 +255,10 @@ func (c *Client) CreateShortLink(reqData ShortLinkCreateRequest) (*ShortLink, er
 
 // GetShortLink retrieves a short link using its URL.
 func (c *Client) GetShortLink(shortURL string) (*ShortLink, error) {
-	query := "short_url=" + shortURL
+	query := url.Values{}
+	query.Set("short_url", shortURL)
 	var link ShortLink
-	err := c.doRequest("GET", "/api/v1/link", query, nil, &link)
+	err := c.doRequest(http.MethodGet, "/api/v1/link", query, nil, &link)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +268,7 @@ func (c *Client) GetShortLink(shortURL string) (*ShortLink, error) {
 // UpdateShortLink updates an existing short link.
 func (c *Client) UpdateShortLink(reqData ShortLinkUpdateRequest) (*ShortLink, error) {
 	var link ShortLink
-	err := c.doRequest("PUT", "/api/v1/link", "", reqData, &link)
+	err := c.doRequest(http.MethodPut, "/api/v1/link", nil, reqData, &link)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +280,7 @@ func (c *Client) DeleteShortLink(shortURL string) error {
 	reqBody := map[string]string{
 		"short_url": shortURL,
 	}
-	return c.doRequest("DELETE", "/api/v1/link", "", reqBody, nil)
+	return c.doRequest(http.MethodDelete, "/api/v1/link", nil, reqBody, nil)
 }
 
 // ExpandRequest is used to expand a short link.
@@ -242,77 +298,420 @@ type ExpandResponse struct {
 // ExpandShortLink expands a short URL to its original long URL.
 func (c *Client) ExpandShortLink(reqData ExpandRequest) (*ExpandResponse, error) {
 	var resp ExpandResponse
-	err := c.doRequest("POST", "/api/v1/link/expand", "", reqData, &resp)
+	err := c.doRequest(http.MethodPost, "/api/v1/link/expand", nil, reqData, &resp)
 	if err != nil {
 		return nil, err
 	}
 	return &resp, nil
 }
 
-// ListShortLinks retrieves a list of short links using optional query parameters.
-// The queryParams map can include keys such as "search", "tag_ids", "pixel_ids", etc.
-func (c *Client) ListShortLinks(queryParams map[string]string) (string, error) {
-	query := ""
-	first := true
-	for k, v := range queryParams {
-		if !first {
-			query += "&"
-		}
-		query += fmt.Sprintf("%s=%s", k, v)
-		first = false
+// ListShortLinksOptions includes optional filters for list endpoint.
+type ListShortLinksOptions struct {
+	Search    string
+	TagIDs    []int
+	PixelIDs  []int
+	StartDate string
+	EndDate   string
+	Domains   []int
+	Page      int
+}
+
+// ShortLinkListResponse is the paginated response for listing short links.
+type ShortLinkListResponse struct {
+	CurrentPage int         `json:"current_page"`
+	Data        []ShortLink `json:"data"`
+	LastPage    int         `json:"last_page,omitempty"`
+	PerPage     int         `json:"per_page,omitempty"`
+	Total       int         `json:"total,omitempty"`
+}
+
+// ListShortLinksDetailed retrieves short links with typed filter options.
+func (c *Client) ListShortLinksDetailed(options ListShortLinksOptions) (*ShortLinkListResponse, error) {
+	query := url.Values{}
+	if options.Search != "" {
+		query.Set("search", options.Search)
 	}
-	// The API returns a plain text JSON string.
-	var result string
-	err := c.doRequest("GET", "/api/v1/link/list", query, nil, &result)
+	addIndexedIntSlice(query, "tag_ids", options.TagIDs)
+	addIndexedIntSlice(query, "pixel_ids", options.PixelIDs)
+	if options.StartDate != "" {
+		query.Set("start_date", options.StartDate)
+	}
+	if options.EndDate != "" {
+		query.Set("end_date", options.EndDate)
+	}
+	addIndexedIntSlice(query, "domains", options.Domains)
+	if options.Page > 0 {
+		query.Set("page", strconv.Itoa(options.Page))
+	}
+
+	var result ShortLinkListResponse
+	err := c.doRequest(http.MethodGet, "/api/v1/link/list", query, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ListShortLinks retrieves a list of short links using optional query parameters.
+// The returned string is the raw JSON payload.
+func (c *Client) ListShortLinks(queryParams map[string]string) (string, error) {
+	var raw []byte
+	err := c.doRequest(http.MethodGet, "/api/v1/link/list", queryFromMap(queryParams), nil, &raw)
 	if err != nil {
 		return "", err
 	}
-	return result, nil
+	return string(raw), nil
+}
+
+// BulkShortenLink represents one entry in a bulk shorten request.
+type BulkShortenLink struct {
+	LongURL     string  `json:"long_url"`
+	Backhalf    *string `json:"backhalf,omitempty"`
+	Password    *string `json:"password,omitempty"`
+	Description *string `json:"description,omitempty"`
 }
 
 // BulkShortenRequest is used for bulk shortening of links.
+// Links can be []BulkShortenLink, []string, or the raw format accepted by the API.
 type BulkShortenRequest struct {
-	Domain string   `json:"domain"`
-	Links  []string `json:"links"` // For simplicity, using a slice of URLs.
-	Tags   []int    `json:"tags,omitempty"`
-	Pixels []int    `json:"pixels,omitempty"`
+	Domain string      `json:"domain"`
+	Links  interface{} `json:"links"`
+	Tags   []int       `json:"tags,omitempty"`
+	Pixels []int       `json:"pixels,omitempty"`
 }
 
-// BulkShortenLinks sends a bulk shorten request.
+// BulkShortenLinks sends a bulk shorten request and returns the raw API payload.
 func (c *Client) BulkShortenLinks(reqData BulkShortenRequest) (string, error) {
-	var result string
-	err := c.doRequest("POST", "/api/v1/link/bulk", "", reqData, &result)
+	var raw []byte
+	err := c.doRequest(http.MethodPost, "/api/v1/link/bulk", nil, reqData, &raw)
 	if err != nil {
 		return "", err
 	}
-	return result, nil
+	return string(raw), nil
+}
+
+// BulkUpdateLink represents one entry in a bulk update request.
+type BulkUpdateLink struct {
+	ShortURL    string  `json:"short_url"`
+	LongURL     string  `json:"long_url,omitempty"`
+	Backhalf    *string `json:"backhalf,omitempty"`
+	Password    *string `json:"password,omitempty"`
+	Description *string `json:"description,omitempty"`
+}
+
+// BulkUpdateRequest is used for bulk updating links.
+// Links can be []BulkUpdateLink or the raw format accepted by the API.
+type BulkUpdateRequest struct {
+	Links  interface{} `json:"links"`
+	Tags   []int       `json:"tags,omitempty"`
+	Pixels []int       `json:"pixels,omitempty"`
+}
+
+// BulkUpdateLinks updates multiple short links and returns the raw API payload.
+func (c *Client) BulkUpdateLinks(reqData BulkUpdateRequest) (string, error) {
+	var raw []byte
+	err := c.doRequest(http.MethodPost, "/api/v1/link/bulk/update", nil, reqData, &raw)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 // =====================
 // Stats Management
 // =====================
 
-// Stats represents the statistics for a short link.
+// Stats represents link stats.
 type Stats struct {
-	Clicks       int                    `json:"clicks"`
-	UniqueClicks int                    `json:"unique_clicks"`
-	Browsers     []interface{}          `json:"browsers"`
-	Countries    []interface{}          `json:"countries"`
-	Referrers    []interface{}          `json:"referrers"`
-	Platforms    []interface{}          `json:"platforms"`
-	DailyClicks  []interface{}          `json:"daily_clicks"`
-	Data         map[string]interface{} `json:"data"`
+	Clicks       int                      `json:"clicks"`
+	UniqueClicks int                      `json:"unique_clicks"`
+	TotalQRScans int                      `json:"total_qr_scans,omitempty"`
+	Browsers     []map[string]interface{} `json:"browsers"`
+	Countries    []map[string]interface{} `json:"countries"`
+	Cities       []map[string]interface{} `json:"cities,omitempty"`
+	Referrers    []map[string]interface{} `json:"referrers"`
+	Platforms    []map[string]interface{} `json:"platforms"`
+	DailyClicks  []map[string]interface{} `json:"daily_clicks"`
+	LinkClicks   []map[string]interface{} `json:"link_clicks,omitempty"`
+	Data         map[string]interface{}   `json:"data"`
 }
 
-// GetStats retrieves statistics for a given short link.
+// StatsRequest includes parameters for the stats endpoints.
+type StatsRequest struct {
+	ShortURL  string
+	StartDate string
+	EndDate   string
+}
+
+// GetStats retrieves statistics for a short link.
 func (c *Client) GetStats(shortURL string) (*Stats, error) {
-	query := "short_url=" + shortURL
+	return c.GetStatsWithRange(StatsRequest{
+		ShortURL: shortURL,
+	})
+}
+
+// GetStatsWithRange retrieves statistics for a short link with an optional date range.
+func (c *Client) GetStatsWithRange(reqData StatsRequest) (*Stats, error) {
+	query := url.Values{}
+	query.Set("short_url", reqData.ShortURL)
+	if reqData.StartDate != "" {
+		query.Set("start_date", reqData.StartDate)
+	}
+	if reqData.EndDate != "" {
+		query.Set("end_date", reqData.EndDate)
+	}
+
 	var stats Stats
-	err := c.doRequest("GET", "/api/v1/link/stats", query, nil, &stats)
+	err := c.doRequest(http.MethodGet, "/api/v1/link/stats", query, nil, &stats)
 	if err != nil {
 		return nil, err
 	}
 	return &stats, nil
+}
+
+// =====================
+// OneLink Management
+// =====================
+
+// OneLinkStatsRequest includes parameters for OneLink stats.
+type OneLinkStatsRequest struct {
+	ShortURL  string
+	StartDate string
+	EndDate   string
+}
+
+// OneLinkStats represents OneLink statistics.
+type OneLinkStats struct {
+	Clicks       int                      `json:"clicks"`
+	UniqueClicks int                      `json:"unique_clicks"`
+	TotalQRScans int                      `json:"total_qr_scans"`
+	Browsers     []map[string]interface{} `json:"browsers"`
+	Countries    []map[string]interface{} `json:"countries"`
+	Cities       []map[string]interface{} `json:"cities"`
+	Referrers    []map[string]interface{} `json:"referrers"`
+	Platforms    []map[string]interface{} `json:"platforms"`
+	DailyClicks  []map[string]interface{} `json:"daily_clicks"`
+	LinkClicks   []map[string]interface{} `json:"link_clicks"`
+	Data         map[string]interface{}   `json:"data"`
+}
+
+// GetOneLinkStats retrieves OneLink stats with optional date range.
+func (c *Client) GetOneLinkStats(reqData OneLinkStatsRequest) (*OneLinkStats, error) {
+	query := url.Values{}
+	query.Set("short_url", reqData.ShortURL)
+	if reqData.StartDate != "" {
+		query.Set("start_date", reqData.StartDate)
+	}
+	if reqData.EndDate != "" {
+		query.Set("end_date", reqData.EndDate)
+	}
+
+	var stats OneLinkStats
+	err := c.doRequest(http.MethodGet, "/api/v1/onelink/stats", query, nil, &stats)
+	if err != nil {
+		return nil, err
+	}
+	return &stats, nil
+}
+
+// DeleteOneLinkStats deletes OneLink stats for a short URL.
+func (c *Client) DeleteOneLinkStats(shortURL string) error {
+	reqBody := map[string]string{
+		"short_url": shortURL,
+	}
+	return c.doRequest(http.MethodDelete, "/api/v1/onelink/stat", nil, reqBody, nil)
+}
+
+// OneLink represents a OneLink item.
+type OneLink struct {
+	ID          int         `json:"id"`
+	ShortID     string      `json:"short_id"`
+	ShortURL    string      `json:"short_url"`
+	Domain      string      `json:"domain"`
+	Title       string      `json:"title"`
+	Description string      `json:"description"`
+	AvatarURL   string      `json:"avatar_url"`
+	Meta        interface{} `json:"meta"`
+	CreatedAt   string      `json:"created_at"`
+	UpdatedAt   string      `json:"updated_at"`
+	LastClicked string      `json:"last_clicked,omitempty"`
+}
+
+// OneLinkListResponse is a paginated OneLink response.
+type OneLinkListResponse struct {
+	CurrentPage int       `json:"current_page"`
+	Data        []OneLink `json:"data"`
+	LastPage    int       `json:"last_page,omitempty"`
+	PerPage     int       `json:"per_page,omitempty"`
+	Total       int       `json:"total,omitempty"`
+}
+
+// ListOneLinks retrieves paginated OneLink records.
+func (c *Client) ListOneLinks(page int) (*OneLinkListResponse, error) {
+	query := url.Values{}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
+	}
+
+	var result OneLinkListResponse
+	err := c.doRequest(http.MethodGet, "/api/v1/onelink/list", query, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// =====================
+// UTM Preset Management
+// =====================
+
+// UTMPreset represents a UTM preset object.
+type UTMPreset struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Source    string `json:"source"`
+	Medium    string `json:"medium"`
+	Campaign  string `json:"campaign"`
+	Content   string `json:"content"`
+	Term      string `json:"term"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// UTMPresetRequest is used to create/update a UTM preset.
+type UTMPresetRequest struct {
+	Name     string `json:"name"`
+	Source   string `json:"source"`
+	Medium   string `json:"medium"`
+	Campaign string `json:"campaign"`
+	Content  string `json:"content"`
+	Term     string `json:"term"`
+}
+
+func decodeUTMPreset(data []byte) (*UTMPreset, error) {
+	var preset UTMPreset
+	if err := json.Unmarshal(data, &preset); err == nil {
+		return &preset, nil
+	}
+
+	var wrapped struct {
+		Data UTMPreset `json:"data"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err == nil {
+		return &wrapped.Data, nil
+	}
+	return nil, fmt.Errorf("unable to decode UTM preset response")
+}
+
+// CreateUTMPreset creates a UTM preset.
+func (c *Client) CreateUTMPreset(reqData UTMPresetRequest) (*UTMPreset, error) {
+	data, err := c.doRequestRaw(http.MethodPost, "/api/v1/link/utm-preset", nil, reqData)
+	if err != nil {
+		return nil, err
+	}
+	return decodeUTMPreset(data)
+}
+
+// ListUTMPresets retrieves all UTM presets.
+func (c *Client) ListUTMPresets() ([]UTMPreset, error) {
+	data, err := c.doRequestRaw(http.MethodGet, "/api/v1/link/utm-preset", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var presets []UTMPreset
+	if err := json.Unmarshal(data, &presets); err == nil {
+		return presets, nil
+	}
+
+	var wrapped struct {
+		Data []UTMPreset `json:"data"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err == nil {
+		return wrapped.Data, nil
+	}
+	return nil, fmt.Errorf("unable to decode UTM preset list response")
+}
+
+// GetUTMPreset retrieves a UTM preset by ID.
+func (c *Client) GetUTMPreset(id int) (*UTMPreset, error) {
+	path := fmt.Sprintf("/api/v1/link/utm-preset/%d", id)
+	data, err := c.doRequestRaw(http.MethodGet, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return decodeUTMPreset(data)
+}
+
+// UpdateUTMPreset updates a UTM preset by ID.
+func (c *Client) UpdateUTMPreset(id int, reqData UTMPresetRequest) (*UTMPreset, error) {
+	path := fmt.Sprintf("/api/v1/link/utm-preset/%d", id)
+	data, err := c.doRequestRaw(http.MethodPut, path, nil, reqData)
+	if err != nil {
+		return nil, err
+	}
+	return decodeUTMPreset(data)
+}
+
+// DeleteUTMPreset deletes a UTM preset by ID.
+func (c *Client) DeleteUTMPreset(id int) error {
+	path := fmt.Sprintf("/api/v1/link/utm-preset/%d", id)
+	return c.doRequest(http.MethodDelete, path, nil, nil, nil)
+}
+
+// =====================
+// QR Code Management
+// =====================
+
+// QRCodeRequest includes query options for retrieving a QR code.
+type QRCodeRequest struct {
+	ShortURL string
+	Output   string
+	Format   string
+}
+
+// GetQRCode retrieves QR code bytes (image or raw payload based on output parameter).
+func (c *Client) GetQRCode(reqData QRCodeRequest) ([]byte, error) {
+	query := url.Values{}
+	query.Set("short_url", reqData.ShortURL)
+	if reqData.Output != "" {
+		query.Set("output", reqData.Output)
+	}
+	if reqData.Format != "" {
+		query.Set("format", reqData.Format)
+	}
+	return c.doRequestRaw(http.MethodGet, "/api/v1/link/qr-code", query, nil)
+}
+
+// QRCodeUpdateRequest includes QR code customization options.
+type QRCodeUpdateRequest struct {
+	ShortURL        string  `json:"short_url"`
+	Image           *string `json:"image,omitempty"`
+	BackgroundColor *string `json:"background_color,omitempty"`
+	CornerDotsColor *string `json:"corner_dots_color,omitempty"`
+	DotsColor       *string `json:"dots_color,omitempty"`
+	DotsStyle       *string `json:"dots_style,omitempty"`
+	CornerStyle     *string `json:"corner_style,omitempty"`
+}
+
+// QRCode represents a QR code record.
+type QRCode struct {
+	ID            int                    `json:"id"`
+	ShortURL      string                 `json:"short_url"`
+	QRCodeOptions map[string]interface{} `json:"qr_code_options"`
+	TeamID        int                    `json:"team_id"`
+	UserID        int                    `json:"user_id"`
+	UpdatedAt     string                 `json:"updated_at"`
+}
+
+// UpdateQRCode updates QR code options for a short link.
+func (c *Client) UpdateQRCode(reqData QRCodeUpdateRequest) (*QRCode, error) {
+	var qrCode QRCode
+	err := c.doRequest(http.MethodPut, "/api/v1/link/qr-code", nil, reqData, &qrCode)
+	if err != nil {
+		return nil, err
+	}
+	return &qrCode, nil
 }
 
 // =====================
@@ -330,7 +729,7 @@ type Tag struct {
 // ListTags retrieves all tags.
 func (c *Client) ListTags() ([]Tag, error) {
 	var tags []Tag
-	err := c.doRequest("GET", "/api/v1/link/tag", "", nil, &tags)
+	err := c.doRequest(http.MethodGet, "/api/v1/link/tag", nil, nil, &tags)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +742,7 @@ func (c *Client) CreateTag(tagValue string) (*Tag, error) {
 		"tag": tagValue,
 	}
 	var tag Tag
-	err := c.doRequest("POST", "/api/v1/link/tag", "", reqBody, &tag)
+	err := c.doRequest(http.MethodPost, "/api/v1/link/tag", nil, reqBody, &tag)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +753,7 @@ func (c *Client) CreateTag(tagValue string) (*Tag, error) {
 func (c *Client) GetTag(id int) (*Tag, error) {
 	path := fmt.Sprintf("/api/v1/link/tag/%d", id)
 	var tag Tag
-	err := c.doRequest("GET", path, "", nil, &tag)
+	err := c.doRequest(http.MethodGet, path, nil, nil, &tag)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +767,7 @@ func (c *Client) UpdateTag(id int, tagValue string) (*Tag, error) {
 		"tag": tagValue,
 	}
 	var tag Tag
-	err := c.doRequest("PUT", path, "", reqBody, &tag)
+	err := c.doRequest(http.MethodPut, path, nil, reqBody, &tag)
 	if err != nil {
 		return nil, err
 	}
@@ -378,5 +777,5 @@ func (c *Client) UpdateTag(id int, tagValue string) (*Tag, error) {
 // DeleteTag deletes a tag by its ID.
 func (c *Client) DeleteTag(id int) error {
 	path := fmt.Sprintf("/api/v1/link/tag/%d", id)
-	return c.doRequest("DELETE", path, "", nil, nil)
+	return c.doRequest(http.MethodDelete, path, nil, nil, nil)
 }
